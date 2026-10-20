@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manajemen Tugas - TaskFlow Manager</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        [x-cloak] { display: none !important; }
+    </style>
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('tugasApp', () => ({
+                session: JSON.parse(localStorage.getItem("taskflow_session") || "{}"),
+                activeTeam: JSON.parse(localStorage.getItem("active_team") || "{}"),
+                teams: [],
+                tasks: [],
+                programmers: [],
+                searchQuery: '',
+                statusFilter: '',
+                perPage: 10,
+                currentPage: 1,
+                showModal: false,
+                showTeamModal: false,
+                isEdit: false,
+                form: { id: null, namaTugas: '', tanggal: '', status: 'Akan Datang', keterangan: '', koreksi: '', fotoKoreksi: [], assignedTo: [] },
+                teamForm: { namaAplikasi: '', programmerIds: [] },
+
+                async initApp() {
+                    const now = new Date().getTime();
+                    if (!this.session.user || (now - this.session.loginTime > 30 * 60 * 1000)) {
+                        localStorage.removeItem("taskflow_session");
+                        window.location.href = "login.html";
+                        return;
+                    }
+                    await this.fetchTeamsAndUsers();
+
+                    // Jika belum ada team yang dipilih, otomatis buka modal pilih team
+                    if (!this.activeTeam.id) {
+                        this.showTeamModal = true;
+                    } else {
+                        await this.fetchTasks();
+                    }
+                },
+
+                async fetchTeamsAndUsers() {
+                    try {
+                        const { getFirestore, collection, getDocs } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                        const db = window.firebaseDb;
+
+                        // Ambil daftar team aplikasi
+                        const teamSnap = await getDocs(collection(db, "teams"));
+                        this.teams = teamSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+                        // Ambil daftar programmer
+                        const userSnap = await getDocs(collection(db, "users"));
+                        this.programmers = userSnap.docs.map(d => d.data()).filter(u => u.role === 'pgm');
+                    } catch(e) { console.error(e); }
+                },
+
+                async fetchTasks() {
+                    if (!this.activeTeam.id) return;
+                    try {
+                        const { getFirestore, collection, getDocs } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                        const db = window.firebaseDb;
+
+                        const taskSnap = await getDocs(collection(db, "tasks"));
+                        let allTasks = taskSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+                        allTasks = allTasks.filter(t => t.teamId === this.activeTeam.id);
+
+                        if (this.session.role === 'pgm') {
+                            allTasks = allTasks.filter(t => t.assignedTo && t.assignedTo.includes(this.session.user));
+                        }
+
+                        this.tasks = allTasks;
+                    } catch(e) { console.error(e); }
+                },
+
+                selectTable(team) {
+                    this.activeTeam = team;
+                    localStorage.setItem("active_team", JSON.stringify(team));
+                    this.showTeamModal = false;
+                    this.fetchTasks();
+                },
+
+                saveNewTeam() {
+                    if (!this.teamForm.namaAplikasi || this.teamForm.programmerIds.length === 0) {
+                        Swal.fire('Peringatan', 'Nama aplikasi dan minimal 1 programmer harus diisi!', 'warning');
+                        return;
+                    }
+
+                    Swal.fire({
+                        title: 'Simpan Team Aplikasi?',
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonText: 'Ya, Simpan',
+                        cancelButtonText: 'Batal',
+                        background: '#0f172a',
+                        color: '#f8fafc'
+                    }).then(async (result) => {
+                        if (result.isConfirmed) {
+                            try {
+                                const { addDoc, collection } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                                const db = window.firebaseDb;
+
+                                const newTeamRef = await addDoc(collection(db, "teams"), {
+                                    namaAplikasi: this.teamForm.namaAplikasi,
+                                    programmerIds: this.teamForm.programmerIds,
+                                    createdBy: this.session.user
+                                });
+
+                                const createdTeam = {
+                                    id: newTeamRef.id,
+                                    namaAplikasi: this.teamForm.namaAplikasi,
+                                    programmerIds: this.teamForm.programmerIds
+                                };
+
+                                await this.fetchTeamsAndUsers();
+                                this.selectTable(createdTeam);
+                                this.teamForm = { namaAplikasi: '', programmerIds: [] };
+                                Swal.fire({ icon: 'success', title: 'Berhasil', text: 'Team aplikasi berhasil dibuat.', timer: 1500, showConfirmButton: false });
+                            } catch(e) {
+                                Swal.fire('Error', e.message, 'error');
+                            }
+                        }
+                    });
+                },
+
+                get filteredTasks() {
+                    return this.tasks.filter(t => {
+                        const matchSearch = t.namaTugas.toLowerCase().includes(this.searchQuery.toLowerCase());
+                        const matchStatus = this.statusFilter === '' || t.status === this.statusFilter;
+                        return matchSearch && matchStatus;
+                    });
+                },
+
+                get totalPages() {
+                    return Math.ceil(this.filteredTasks.length / this.perPage) || 1;
+                },
+
+                get paginatedTasks() {
+                    const start = (this.currentPage - 1) * this.perPage;
+                    return this.filteredTasks.slice(start, start + this.perPage);
+                },
+
+                nextPage() { if (this.currentPage < this.totalPages) this.currentPage++; },
+                prevPage() { if (this.currentPage > 1) this.currentPage--; },
+
+                openModal() {
+                    this.isEdit = false;
+                    this.form = { id: null, namaTugas: '', tanggal: '', status: 'Akan Datang', keterangan: '', koreksi: '', fotoKoreksi: [], assignedTo: [] };
+                    this.showModal = true;
+                },
+
+                editModal(task) {
+                    this.isEdit = true;
+                    this.form = { 
+                        ...task, 
+                        assignedTo: Array.isArray(task.assignedTo) ? task.assignedTo : [task.assignedTo],
+                        fotoKoreksi: Array.isArray(task.fotoKoreksi) ? task.fotoKoreksi : []
+                    };
+                    this.showModal = true;
+                },
+
+                handleFileSelect(event) {
+                    const files = event.target.files;
+                    for (let file of files) {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            this.form.fotoKoreksi.push(e.target.result);
+                        };
+                        reader.readAsDataURL(file);
+                    }
+                },
+
+                handlePaste(event) {
+                    const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+                    for (let item of items) {
+                        if (item.type.indexOf('image') === 0) {
+                            const blob = item.getAsFile();
+                            const reader = new FileReader();
+                            reader.onload = (e) => {
+                                this.form.fotoKoreksi.push(e.target.result);
+                                Swal.fire({
+                                    toast: true,
+                                    position: 'top-end',
+                                    icon: 'success',
+                                    title: 'Screenshot berhasil ditempel (Ctrl+V)',
+                                    showConfirmButton: false,
+                                    timer: 1500,
+                                    background: '#0f172a',
+                                    color: '#f8fafc'
+                                });
+                            };
+                            reader.readAsDataURL(blob);
+                        }
+                    }
+                },
+
+                removePhoto(index) {
+                    this.form.fotoKoreksi.splice(index, 1);
+                },
+
+                viewImage(url) {
+                    Swal.fire({
+                        imageUrl: url,
+                        imageAlt: 'Foto Koreksi',
+                        background: '#0f172a',
+                        confirmButtonColor: '#10b981',
+                        width: 'auto'
+                    });
+                },
+
+                confirmSave() {
+                    if (this.session.role === 'PM' && this.form.assignedTo.length === 0) {
+                        Swal.fire('Peringatan', 'Pilih minimal satu programmer untuk tugas ini!', 'warning');
+                        return;
+                    }
+
+                    Swal.fire({
+                        title: 'Konfirmasi Simpan',
+                        text: 'Apakah Anda yakin ingin menyimpan data tugas ini?',
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonText: 'Ya, Simpan',
+                        cancelButtonText: 'Batal',
+                        background: '#0f172a',
+                        color: '#f8fafc'
+                    }).then(async (result) => {
+                        if (result.isConfirmed) {
+                            try {
+                                const { doc, addDoc, updateDoc, collection } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                                const db = window.firebaseDb;
+
+                                let dataToSave = { ...this.form };
+
+                                if (this.session.role === 'pgm') {
+                                    delete dataToSave.assignedTo;
+                                    delete dataToSave.koreksi;
+                                    delete dataToSave.fotoKoreksi;
+                                }
+
+                                if (this.isEdit) {
+                                    const { id, ...updateData } = dataToSave;
+                                    await updateDoc(doc(db, "tasks", id), updateData);
+                                } else {
+                                    const { id, ...addData } = dataToSave;
+                                    addData.teamId = this.activeTeam.id;
+                                    addData.createdBy = this.session.user;
+                                    await addDoc(collection(db, "tasks"), addData);
+                                }
+                                this.showModal = false;
+                                await this.fetchTasks();
+                                Swal.fire({ icon: 'success', title: 'Berhasil!', text: 'Data tugas berhasil disimpan.', timer: 1500, showConfirmButton: false });
+                            } catch(e) {
+                                Swal.fire('Error', e.message, 'error');
+                            }
+                        }
+                    });
+                },
+
+                deleteTask(id) {
+                    Swal.fire({
+                        title: 'Hapus Tugas?',
+                        text: 'Data yang dihapus tidak dapat dikembalikan!',
+                        icon: 'warning',
+                        showCancelButton: true,
+                        confirmButtonText: 'Ya, Hapus',
+                        cancelButtonText: 'Batal',
+                        background: '#0f172a',
+                        color: '#f8fafc'
+                    }).then(async (result) => {
+                        if (result.isConfirmed) {
+                            try {
+                                const { doc, deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                                const db = window.firebaseDb;
+
+                                await deleteDoc(doc(db, "tasks", id));
+                                await this.fetchTasks();
+                                Swal.fire({ icon: 'success', title: 'Terhapus!', text: 'Tugas berhasil dihapus.', timer: 1500, showConfirmButton: false });
+                            } catch(e) {
+                                Swal.fire('Error', e.message, 'error');
+                            }
+                        }
+                    });
+                },
+
+                logout() {
+                    localStorage.removeItem("taskflow_session");
+                    localStorage.removeItem("active_team");
+                    window.location.href = "login.html";
+                }
+            }));
+        });
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="tugasApp()" x-init="initApp()">
+
+    <!-- Navbar -->
+    <nav class="bg-slate-900/80 backdrop-blur-md border-b border-slate-800 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center space-x-8">
+                    <span class="text-xl font-bold bg-gradient-to-r from-emerald-400 to-teal-300 bg-clip-text text-transparent">TaskFlow</span>
+                   <div class="hidden md:flex space-x-4">
+    <a href="home.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Home</a>
+    <a href="tugas.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Manajemen Tugas</a>
+    <!-- Menu Manajemen User HANYA MUNCUL JIKA ROLE == 'PM' -->
+    <template x-if="session.role === 'PM'">
+        <a href="bagan.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Bagan Tugas</a>
+        <!-- <a href="user.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Manajemen User</a> -->
+    </template>
+    <template x-if="session.role === 'PM'">
+        <!-- <a href="bagan.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Bagan Tugas</a> -->
+        <a href="user.html" class="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800/50 text-sm">Manajemen User</a>
+    </template>
+</div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <span class="text-xs px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-semibold" x-text="session.role"></span>
+                    <button @click="logout()" class="text-sm bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 px-3 py-1.5 rounded-lg border border-rose-500/20 transition cursor-pointer">Keluar</button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        <!-- Header & Tombol Ganti Team -->
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-slate-900/50 border border-slate-800 p-4 rounded-2xl">
+            <div class="flex items-center space-x-3">
+                <button @click="showTeamModal = true" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold border border-slate-700 transition flex items-center space-x-2 cursor-pointer">
+                    <span>📁 Ganti / Pilih Team</span>
+                </button>
+                <div>
+                    <h1 class="text-lg font-bold text-white" x-text="activeTeam.namaAplikasi ? 'Team: ' + activeTeam.namaAplikasi : 'Belum Memilih Team'"></h1>
+                    <p class="text-xs text-slate-400">Kelola tugas dan penugasan programmer aplikasi ini.</p>
+                </div>
+            </div>
+            <button @click="openModal()" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold px-4 py-2.5 rounded-xl shadow-lg shadow-emerald-500/20 transition flex items-center space-x-2 text-sm cursor-pointer">
+                <span>+ Tambah Tugas</span>
+            </button>
+        </div>
+
+        <!-- Filter & Search -->
+        <div class="bg-slate-900/50 border border-slate-800 p-4 rounded-2xl flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex flex-col sm:flex-row items-center gap-3 w-full md:w-auto">
+                <input type="text" x-model="searchQuery" placeholder="Cari nama tugas..." 
+                    class="bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-400 w-full sm:w-64">
+                
+                <select x-model="statusFilter" class="bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-emerald-400 w-full sm:w-auto">
+                    <option value="">Semua Status</option>
+                    <option value="Akan Datang">Akan Datang</option>
+                    <option value="Berjalan">Berjalan</option>
+                    <option value="Belum Selesai">Belum Selesai</option>
+                    <option value="Selesai">Selesai</option>
+                </select>
+            </div>
+
+            <div class="flex items-center space-x-2 text-sm text-slate-400 w-full md:w-auto justify-end">
+                <span>Tampilkan:</span>
+                <select x-model.number="perPage" class="bg-slate-800/50 border border-slate-700 rounded-xl px-3 py-1.5 text-white focus:outline-none focus:border-emerald-400">
+                    <option value="10">10</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Tabel Data -->
+        <div class="bg-slate-900/50 border border-slate-800 rounded-3xl overflow-hidden shadow-xl">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-slate-800/50 border-b border-slate-800 text-xs uppercase tracking-wider text-slate-400">
+                            <th class="p-4">Nama Tugas</th>
+                            <th class="p-4">Programmer</th>
+                            <th class="p-4">Tanggal</th>
+                            <th class="p-4">Status</th>
+                            <th class="p-4">Keterangan</th>
+                            <th class="p-4">Koreksi & Foto</th>
+                            <th class="p-4 text-center">Aksi</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/60 text-sm">
+                        <template x-for="task in paginatedTasks" :key="task.id">
+                            <tr class="hover:bg-slate-800/20 transition">
+                                <td class="p-4 font-semibold text-white" x-text="task.namaTugas"></td>
+                                <td class="p-4">
+                                    <div class="flex flex-wrap gap-1">
+                                        <template x-for="pgm in (task.assignedTo || [])">
+                                            <span class="text-xs px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium" x-text="pgm"></span>
+                                        </template>
+                                    </div>
+                                </td>
+                                <td class="p-4 text-slate-300" x-text="task.tanggal"></td>
+                                <td class="p-4">
+                                    <span class="text-xs px-2.5 py-1 rounded-full font-semibold"
+                                        :class="{
+                                            'bg-amber-500/10 text-amber-400 border border-amber-500/20': task.status === 'Akan Datang',
+                                            'bg-blue-500/10 text-blue-400 border border-blue-500/20': task.status === 'Berjalan',
+                                            'bg-rose-500/10 text-rose-400 border border-rose-500/20': task.status === 'Belum Selesai',
+                                            'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20': task.status === 'Selesai'
+                                        }"
+                                        x-text="task.status"></span>
+                                </td>
+                                <td class="p-4 text-slate-400" x-text="task.keterangan"></td>
+                                <td class="p-4 space-y-1.5">
+                                    <div class="text-amber-300 italic text-xs" x-text="task.koreksi || '-'"></div>
+                                    <div class="flex flex-wrap gap-1.5" x-show="task.fotoKoreksi && task.fotoKoreksi.length > 0">
+                                        <template x-for="imgUrl in (task.fotoKoreksi || [])">
+                                            <img :src="imgUrl" @click="viewImage(imgUrl)" class="w-10 h-10 object-cover rounded-lg border border-slate-700 cursor-pointer hover:scale-105 transition" title="Klik untuk memperbesar">
+                                        </template>
+                                    </div>
+                                </td>
+                                <td class="p-4 text-center space-x-2">
+                                    <button @click="editModal(task)" class="px-3 py-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 rounded-lg border border-blue-500/20 text-xs transition cursor-pointer">Edit</button>
+                                    <template x-if="session.role === 'PM'">
+                                        <button @click="deleteTask(task.id)" class="px-3 py-1 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 rounded-lg border border-rose-500/20 text-xs transition cursor-pointer">Hapus</button>
+                                    </template>
+                                </td>
+                            </tr>
+                        </template>
+                        <tr x-show="paginatedTasks.length === 0">
+                            <td colspan="7" class="text-center py-8 text-slate-500">Tidak ada data tugas yang ditemukan. Silakan pilih team aplikasi terlebih dahulu.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Pagination -->
+            <div class="p-4 border-t border-slate-800 flex items-center justify-between text-sm text-slate-400">
+                <div>Menampilkan halaman <span x-text="currentPage"></span> dari <span x-text="totalPages || 1"></span></div>
+                <div class="space-x-2">
+                    <button @click="prevPage" :disabled="currentPage === 1" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white transition cursor-pointer">Sebelumnya</button>
+                    <button @click="nextPage" :disabled="currentPage >= totalPages" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white transition cursor-pointer">Selanjutnya</button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal Pilih / Ganti Team (Langsung di halaman tugas) -->
+    <div x-show="showTeamModal" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4" x-cloak>
+        <div class="bg-slate-900 border border-slate-800 rounded-3xl max-w-xl w-full p-6 shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center">
+                <h3 class="text-xl font-bold text-white">Pilih Team Aplikasi Proyek</h3>
+                <button x-show="activeTeam.id" @click="showTeamModal = false" class="text-slate-400 hover:text-white text-sm cursor-pointer">✕</button>
+            </div>
+
+            <!-- List Team yang Sudah Ada -->
+            <div class="space-y-3">
+                <p class="text-xs font-semibold uppercase tracking-wider text-slate-400">Daftar Team Tersedia:</p>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-48 overflow-y-auto pr-1">
+                    <template x-for="team in teams" :key="team.id">
+                        <div @click="selectTable(team)" class="bg-slate-800/40 border border-slate-700 hover:border-emerald-500 p-4 rounded-2xl cursor-pointer transition space-y-2">
+                            <h4 class="font-bold text-white text-sm" x-text="team.namaAplikasi"></h4>
+                            <div class="flex flex-wrap gap-1">
+                                <template x-for="pgm in team.programmerIds">
+                                    <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" x-text="pgm"></span>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+                <div x-show="teams.length === 0" class="text-center py-4 text-slate-500 text-xs">Belum ada team aplikasi.</div>
+            </div>
+
+            <!-- Form Buat Team Baru (Khusus PM) -->
+            <template x-if="session.role === 'PM'">
+                <div class="border-t border-slate-800 pt-5 space-y-4">
+                    <h4 class="text-sm font-bold text-emerald-400">+ Buat Team Aplikasi Baru</h4>
+                    <form @submit.prevent="saveNewTeam()" class="space-y-3">
+                        <div>
+                            <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Nama Aplikasi</label>
+                            <input type="text" x-model="teamForm.namaAplikasi" placeholder="Contoh: E-Retribusi Bapenda" class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2 text-white text-sm focus:outline-none focus:border-emerald-400">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold uppercase text-slate-400 mb-2">Pilih Programmer</label>
+                            <div class="space-y-1.5 max-h-32 overflow-y-auto bg-slate-800/30 p-2.5 rounded-xl border border-slate-700/50">
+                                <template x-for="pgm in programmers">
+                                    <label class="flex items-center space-x-3 text-xs text-slate-300 cursor-pointer hover:text-white">
+                                        <input type="checkbox" :value="pgm.username" x-model="teamForm.programmerIds" class="rounded border-slate-700 text-emerald-500 w-4 h-4">
+                                        <span x-text="pgm.nama + ' (' + pgm.username + ')'"></span>
+                                    </label>
+                                </template>
+                            </div>
+                        </div>
+                        <button type="submit" class="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs transition cursor-pointer">Simpan & Gunakan Team Ini</button>
+                    </form>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- Modal Form Tambah / Edit Tugas -->
+    <div x-show="showModal" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4" x-cloak>
+        <div class="bg-slate-900 border border-slate-800 rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
+            <h3 class="text-xl font-bold text-white" x-text="isEdit ? 'Edit Tugas' : 'Tambah Tugas Baru'"></h3>
+            
+            <form @submit.prevent="confirmSave" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Nama Tugas</label>
+                    <input type="text" x-model="form.namaTugas" required class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-emerald-400 text-sm">
+                </div>
+
+                <div x-show="session.role === 'PM'">
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-2">Tugaskan Kepada Programmer</label>
+                    <div class="space-y-2 max-h-32 overflow-y-auto bg-slate-800/30 p-3 rounded-xl border border-slate-700/50">
+                        <template x-for="pgm in programmers">
+                            <label class="flex items-center space-x-3 text-sm text-slate-300 cursor-pointer hover:text-white">
+                                <input type="checkbox" :value="pgm.username" x-model="form.assignedTo" class="rounded border-slate-700 text-emerald-500 focus:ring-emerald-400 w-4 h-4">
+                                <span x-text="pgm.nama + ' (' + pgm.username + ')'"></span>
+                            </label>
+                        </template>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Tanggal</label>
+                    <input type="date" x-model="form.tanggal" required class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-emerald-400 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Status</label>
+                    <select x-model="form.status" class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-emerald-400 text-sm">
+                        <option value="Akan Datang">Akan Datang</option>
+                        <option value="Berjalan">Berjalan</option>
+                        <option value="Belum Selesai">Belum Selesai</option>
+                        <option value="Selesai">Selesai</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Keterangan</label>
+                    <textarea x-model="form.keterangan" rows="2" class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-emerald-400 text-sm"></textarea>
+                </div>
+
+                <div x-show="session.role === 'PM'" class="space-y-4 border-t border-slate-800 pt-4">
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Catatan Koreksi (PM)</label>
+                        <textarea x-model="form.koreksi" rows="2" class="w-full bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-emerald-400 text-sm" placeholder="Catatan perbaikan..."></textarea>
+                    </div>
+
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Foto Koreksi (Upload File / Ctrl+V Screenshot di sini)</label>
+                        <div @paste.window="handlePaste" class="border-2 border-dashed border-slate-700 hover:border-emerald-500 rounded-2xl p-4 text-center bg-slate-800/30 transition cursor-pointer">
+                            <p class="text-xs text-slate-300 mb-2">Klik untuk pilih file, atau <strong>Tekan Ctrl+V</strong> untuk menempel (paste) tangkapan layar di sini.</p>
+                            <input type="file" multiple accept="image/*" @change="handleFileSelect" class="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-500/10 file:text-emerald-400 hover:file:bg-emerald-500/20 cursor-pointer">
+                        </div>
+
+                        <div class="flex flex-wrap gap-2 mt-3" x-show="form.fotoKoreksi && form.fotoKoreksi.length > 0">
+                            <template x-for="(img, index) in form.fotoKoreksi" :key="index">
+                                <div class="relative group">
+                                    <img :src="img" class="w-16 h-16 object-cover rounded-xl border border-slate-700 shadow-md">
+                                    <button type="button" @click="removePhoto(index)" class="absolute -top-2 -right-2 bg-rose-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs opacity-90 hover:opacity-100 shadow cursor-pointer">×</button>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex justify-end space-x-3 pt-2">
+                    <button type="button" @click="showModal = false" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm transition cursor-pointer">Batal</button>
+                    <button type="submit" class="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm transition cursor-pointer">Simpan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Inisialisasi Firebase Global -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getFirestore } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyByljIox1p4QE2bMKk4bDcAum55DyvKHZw",
+            authDomain: "asmaulhusna-f450b.firebaseapp.com",
+            projectId: "asmaulhusna-f450b",
+            storageBucket: "asmaulhusna-f450b.firebasestorage.app",
+            messagingSenderId: "911657203642",
+            appId: "1:911657203642:web:f706f7eb7a56a9312fcf83"
+        };
+        const app = initializeApp(firebaseConfig);
+        window.firebaseDb = getFirestore(app);
+    </script>
+</body>
+</html>
